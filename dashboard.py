@@ -19,6 +19,8 @@ from importlib.util import find_spec
 
 warnings.filterwarnings("ignore")
 
+DATASET_SCHEMA_VERSION = 4  # CHANGE: cache hardening (+1)
+
 # ============================================================
 # 🔐 SECURITY & AUDIT LOGGING SETUP
 # ============================================================
@@ -601,6 +603,80 @@ def _stable_jitter_pair(key: str, scale_lat: float = 0.35, scale_lon: float = 0.
     return float(rng.normal(0, scale_lat)), float(rng.normal(0, scale_lon))
 
 
+# CHANGE: cache hardening helpers (canonical config + stale dataset detection)
+def validate_canonical_config() -> Tuple[bool, Dict[str, Any]]:
+    """
+    Validate canonical dropdown/data-generation configuration.
+    Checks (required by patch spec):
+      - each state has district mapping
+      - no empty district list
+      - categories non-empty
+    """
+    meta: Dict[str, Any] = {"status": "OK"}
+
+    states = list(STATE_CENTROIDS.keys())
+    missing_states = [s for s in states if s not in DISTRICTS_BY_STATE]
+    empty_district_states = [s for s in states if not DISTRICTS_BY_STATE.get(s)]
+    categories_ok = bool(CRIME_CATEGORIES)
+
+    meta.update(
+        {
+            "states": int(len(states)),
+            "district_states": int(len(DISTRICTS_BY_STATE)),
+            "missing_states": missing_states,
+            "empty_district_states": empty_district_states,
+            "categories": int(len(CRIME_CATEGORIES)),
+        }
+    )
+
+    ok = (not missing_states) and (not empty_district_states) and categories_ok
+    if not ok:
+        meta["status"] = "INVALID"
+    return ok, meta
+
+
+# CHANGE: cache hardening helper (cached dataset completeness vs canonical config)
+def is_cached_dataset_stale(df: pd.DataFrame) -> bool:
+    """
+    Detect stale/incomplete cached datasets by checking canonical coverage:
+      - state coverage
+      - district coverage per state
+      - category coverage
+    """
+    if df is None or df.empty:
+        return True
+
+    required_cols = {"state_name_norm", "district_name_norm", "category"}
+    if not required_cols.issubset(set(df.columns)):
+        return True
+
+    # State coverage: df must contain all canonical states (normalised)
+    canonical_states_norm = {normalize_name(s) for s in STATE_CENTROIDS.keys()}
+    df_states = set(df["state_name_norm"].astype(str).unique().tolist())
+    if not canonical_states_norm.issubset(df_states):
+        return True
+
+    # District coverage per state
+    for state in STATE_CENTROIDS.keys():
+        state_norm = normalize_name(state)
+        canon_districts_norm = {normalize_name(d) for d in DISTRICTS_BY_STATE.get(state, [])}
+        if not canon_districts_norm:
+            return True
+        have = set(
+            df[df["state_name_norm"] == state_norm]["district_name_norm"].astype(str).unique().tolist()
+        )
+        if not canon_districts_norm.issubset(have):
+            return True
+
+    # Category coverage
+    canonical_categories_norm = {normalize_name(c) for c in CRIME_CATEGORIES}
+    df_categories = set(df["category"].astype(str).unique().tolist())
+    if not canonical_categories_norm.issubset(df_categories):
+        return True
+
+    return False
+
+
 # ============================================================
 # 🗺️ GEO BASELINES
 # ============================================================
@@ -636,6 +712,53 @@ STATE_CENTROIDS: Dict[str, Tuple[float, float]] = {
     "Delhi": (28.7041, 77.1025),
 }
 
+# CHANGE: canonical districts for dropdowns + data generation (names reused verbatim)
+DISTRICTS_BY_STATE: Dict[str, list[str]] = {
+    "Andhra Pradesh": ["Visakhapatnam", "Vijayawada", "Guntur", "Nellore", "Kurnool"],
+    "Arunachal Pradesh": ["Itanagar", "Tawang", "Pasighat", "Ziro", "Bomdila"],
+    "Assam": ["Guwahati", "Dibrugarh", "Silchar", "Tezpur", "Jorhat"],
+    "Bihar": ["Patna", "Gaya", "Muzaffarpur", "Bhagalpur", "Purnia"],
+    "Chhattisgarh": ["Raipur", "Bhilai", "Bilaspur", "Durg", "Korba"],
+    "Delhi": ["New Delhi", "North Delhi", "South Delhi", "East Delhi", "West Delhi"],
+    "Goa": ["Panaji", "Margao", "Vasco Da Gama", "Mapusa", "Ponda"],
+    "Gujarat": ["Ahmedabad", "Surat", "Vadodara", "Rajkot", "Bhavnagar"],
+    "Haryana": ["Gurugram", "Faridabad", "Panipat", "Karnal", "Hisar"],
+    "Himachal Pradesh": ["Shimla", "Dharamshala", "Mandi", "Solan", "Kullu"],
+    "Jharkhand": ["Ranchi", "Jamshedpur", "Dhanbad", "Bokaro", "Hazaribagh"],
+    "Karnataka": ["Bengaluru", "Mysuru", "Mangaluru", "Hubballi", "Belagavi"],
+    "Kerala": ["Thiruvananthapuram", "Kochi", "Kozhikode", "Thrissur", "Kollam"],
+    "Madhya Pradesh": ["Bhopal", "Indore", "Jabalpur", "Gwalior", "Ujjain"],
+    "Maharashtra": ["Mumbai", "Pune", "Nagpur", "Nashik", "Thane"],
+    "Manipur": ["Imphal", "Thoubal", "Bishnupur", "Churachandpur", "Senapati"],
+    "Meghalaya": ["Shillong", "Tura", "Jowai", "Nongstoin", "Baghmara"],
+    "Mizoram": ["Aizawl", "Lunglei", "Champhai", "Serchhip", "Kolasib"],
+    "Nagaland": ["Kohima", "Dimapur", "Mokokchung", "Tuensang", "Wokha"],
+    "Odisha": ["Bhubaneswar", "Cuttack", "Rourkela", "Sambalpur", "Puri"],
+    "Punjab": ["Ludhiana", "Amritsar", "Jalandhar", "Patiala", "Bathinda"],
+    "Rajasthan": ["Jaipur", "Jodhpur", "Udaipur", "Kota", "Ajmer"],
+    "Sikkim": ["Gangtok", "Namchi", "Mangan", "Gyalshing", "Pakyong"],
+    "Tamil Nadu": ["Chennai", "Coimbatore", "Madurai", "Salem", "Tiruchirappalli"],
+    "Telangana": ["Hyderabad", "Warangal", "Nizamabad", "Karimnagar", "Khammam"],
+    "Tripura": ["Agartala", "Dharmanagar", "Udaipur", "Kailashahar", "Belonia"],
+    "Uttar Pradesh": ["Agra", "Lucknow", "Varanasi", "Kanpur", "Prayagraj"],
+    "Uttarakhand": ["Dehradun", "Haridwar", "Nainital", "Roorkee", "Haldwani"],
+    "West Bengal": ["Kolkata", "Howrah", "Durgapur", "Siliguri", "Asansol"],
+}
+
+# CHANGE: canonical categories for dropdowns + data generation (names reused verbatim)
+CRIME_CATEGORIES: list[str] = [
+    "Theft",
+    "Robbery",
+    "Burglary",
+    "Assault",
+    "Kidnapping",
+    "Cyber Crime",
+    "Fraud",
+    "Drug Offense",
+    "Domestic Violence",
+    "Murder",
+]
+
 
 def _geo_lat_lon(state_name_norm: str, district_name_norm: str) -> Tuple[float, float]:
     base = STATE_CENTROIDS.get(state_name_norm, (22.9734, 78.6569))
@@ -652,29 +775,23 @@ def _geo_lat_lon(state_name_norm: str, district_name_norm: str) -> Tuple[float, 
 # 📊 DATA LOADING - SYNTHETIC (DEMO)
 # ============================================================
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_crime_data(seed: int = 42) -> pd.DataFrame:
+def load_crime_data(seed: int = 42, schema_version: int = DATASET_SCHEMA_VERSION) -> pd.DataFrame:
     """
     Synthetic data generator for demo.
     Includes arrests for arrest_ratio and ML features.
     """
+    _ = schema_version  # cache-busting/version marker for Streamlit cache
     rng = np.random.default_rng(seed)
 
     years = list(range(2017, 2023))  # 2017-2022 inclusive
-    states = ["Uttar Pradesh", "Maharashtra", "Bihar", "Madhya Pradesh", "Rajasthan"]
-    districts_by_state = {
-        "Uttar Pradesh": ["Agra", "Lucknow", "Varanasi", "Kanpur", "Prayagraj"],
-        "Maharashtra": ["Mumbai", "Pune", "Nagpur", "Nashik", "Thane"],
-        "Bihar": ["Patna", "Gaya", "Muzaffarpur", "Bhagalpur", "Purnia"],
-        "Madhya Pradesh": ["Bhopal", "Indore", "Jabalpur", "Gwalior", "Ujjain"],
-        "Rajasthan": ["Jaipur", "Jodhpur", "Udaipur", "Kota", "Ajmer"],
-    }
-    categories = ["Theft", "Robbery", "Assault", "Fraud", "Murder"]
+    states = sorted(STATE_CENTROIDS.keys())
 
     data = []
     for year in years:
         for state in states:
-            for district in districts_by_state.get(state, []):
-                for category in categories:
+            # CHANGE: use canonical DISTRICTS_BY_STATE and CRIME_CATEGORIES (no inline lists)
+            for district in DISTRICTS_BY_STATE.get(state, []):
+                for category in CRIME_CATEGORIES:
                     base_count = int(rng.integers(120, 1200))
                     # Trend injection: some states/districts gradually rise over time
                     trend_factor = 1.0 + 0.03 * (year - years[0])
@@ -683,11 +800,16 @@ def load_crime_data(seed: int = 42) -> pd.DataFrame:
                         hotspot_factor = 1.18 + 0.02 * (year - years[0])
 
                     category_factor = {
-                        "Theft": 1.05,
-                        "Robbery": 0.85,
-                        "Assault": 0.95,
-                        "Fraud": 1.10,
-                        "Murder": 0.35,
+                        "Theft": 1.10,
+                        "Robbery": 0.90,
+                        "Burglary": 0.96,
+                        "Assault": 0.98,
+                        "Kidnapping": 0.42,
+                        "Cyber Crime": 0.60,
+                        "Fraud": 1.14,
+                        "Drug Offense": 0.55,
+                        "Domestic Violence": 0.82,
+                        "Murder": 0.30,
                     }.get(category, 1.0)
 
                     noise = float(rng.uniform(0.82, 1.22))
@@ -697,13 +819,20 @@ def load_crime_data(seed: int = 42) -> pd.DataFrame:
                     # Arrests: correlate with crime count but with variability; keep under/over ranges
                     arrest_rate = float(np.clip(rng.normal(0.33, 0.10), 0.05, 0.75))
                     # For certain categories, arrest rate tends to differ (demo)
-                    if category in ("Murder", "Assault"):
+                    if category in ("Murder", "Assault", "Kidnapping"):
                         arrest_rate = float(np.clip(arrest_rate + 0.10, 0.05, 0.85))
-                    if category in ("Fraud",):
+                    if category in ("Fraud", "Cyber Crime"):
                         arrest_rate = float(np.clip(arrest_rate - 0.05, 0.03, 0.70))
                     arrests = int(round(count * arrest_rate))
 
-                    crime_type = "Property Crime" if category in ["Theft", "Robbery", "Fraud"] else "Violent Crime"
+                    if category in ["Theft", "Robbery", "Burglary", "Fraud"]:
+                        crime_type = "Property Crime"
+                    elif category in ["Assault", "Kidnapping", "Domestic Violence", "Murder"]:
+                        crime_type = "Violent Crime"
+                    elif category in ["Cyber Crime", "Drug Offense"]:
+                        crime_type = "Special Crime"
+                    else:
+                        crime_type = "Other Crime"
                     data.append(
                         {
                             "year": year,
@@ -1915,7 +2044,8 @@ def render_control_panel(df: pd.DataFrame) -> None:
 
     with col_state:
         st.markdown('<div class="filter-label">📍 State Sector</div>', unsafe_allow_html=True)
-        states = ["ALL STATES"] + sorted(df["state_name_norm"].unique().tolist())
+        # CHANGE: state dropdown sourced from STATE_CENTROIDS keys ONLY (canonical, cache-safe)
+        states = ["ALL STATES"] + sorted(list(STATE_CENTROIDS.keys()))
         # Ensure value remains valid
         if st.session_state.state not in states:
             st.session_state.state = "ALL STATES"
@@ -1930,9 +2060,8 @@ def render_control_panel(df: pd.DataFrame) -> None:
     with col_district:
         st.markdown('<div class="filter-label">🎯 District Zone</div>', unsafe_allow_html=True)
         if st.session_state.state != "ALL STATES":
-            districts = ["ALL DISTRICTS"] + sorted(
-                df[df["state_name_norm"] == st.session_state.state]["district_name_norm"].unique().tolist()
-            )
+            # CHANGE: district dropdown sourced from DISTRICTS_BY_STATE[selected_state] ONLY
+            districts = ["ALL DISTRICTS"] + [normalize_name(d) for d in DISTRICTS_BY_STATE.get(st.session_state.state, [])]
             if st.session_state.district not in districts:
                 st.session_state.district = "ALL DISTRICTS"
             st.session_state.district = st.selectbox(
@@ -1955,7 +2084,8 @@ def render_control_panel(df: pd.DataFrame) -> None:
 
     with col_category:
         st.markdown('<div class="filter-label">🔍 Crime Category</div>', unsafe_allow_html=True)
-        categories = ["ALL CATEGORIES"] + sorted(df["category"].unique().tolist())
+        # CHANGE: category dropdown sourced from CRIME_CATEGORIES ONLY
+        categories = ["ALL CATEGORIES"] + [normalize_name(c) for c in CRIME_CATEGORIES]
         if st.session_state.category not in categories:
             st.session_state.category = "ALL CATEGORIES"
         st.session_state.category = st.selectbox(
@@ -3161,8 +3291,25 @@ def render_tabs(
 # 13. audit log summary event
 # ============================================================
 def main() -> None:
-    # 1) Load data
-    df = load_crime_data(seed=42)
+    # CHANGE: validate canonical config before running (required)
+    ok, cfg_meta = validate_canonical_config()
+    if not ok:
+        log_action("Canonical Config Invalid", details=json.dumps({k: str(v) for k, v in cfg_meta.items()}))
+        st.error("🚨 CONFIG ERROR: Canonical dropdown configuration is invalid. Fix DISTRICTS_BY_STATE / CRIME_CATEGORIES.")
+        st.stop()
+
+    # 1) Load data (load once)
+    df = load_crime_data(seed=42, schema_version=DATASET_SCHEMA_VERSION)
+
+    # CHANGE: detect stale cached dataset; clear cache once; reload once
+    if is_cached_dataset_stale(df):
+        log_action(
+            "Cache Cleared",
+            details="Cached dataset stale/incomplete vs canonical STATE_CENTROIDS/DISTRICTS_BY_STATE/CRIME_CATEGORIES; reloading.",
+        )
+        st.cache_data.clear()
+        df = load_crime_data(seed=42, schema_version=DATASET_SCHEMA_VERSION)
+
     init_session_state(df)
 
     # 4) Header (render early)
